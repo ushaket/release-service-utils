@@ -864,7 +864,7 @@ class TestRun:
             )
 
     def test_basic_push_flow(self, tmp_path: Path, run_mocks) -> None:
-        """Push each tag of a single component and write the results file."""
+        """Copy a component once per repository and write the results file."""
         snapshot_file = tmp_path / "snapshot.json"
         _write_json(snapshot_file, _default_snapshot())
         data_file = tmp_path / "data.json"
@@ -873,7 +873,7 @@ class TestRun:
 
         push_snapshot.run(snapshot_file, data_file, results_dir, 5, 0, False)
 
-        assert run_mocks.push_image.call_count == 2
+        assert run_mocks.push_image.call_count == 1
         results_file = results_dir / "push-snapshot-results.json"
         assert results_file.is_file()
         results = json.loads(results_file.read_text(encoding="utf-8"))
@@ -881,7 +881,7 @@ class TestRun:
         assert results["images"][0]["shasum"] == "sha256:origin123"
 
     def test_source_container_push(self, tmp_path: Path, run_mocks) -> None:
-        """Push the source container tag alongside the main and tag-source pushes."""
+        """Copy the source and main images once for their respective tags."""
         snapshot_file = tmp_path / "snapshot.json"
         _write_json(
             snapshot_file,
@@ -902,8 +902,8 @@ class TestRun:
 
         push_snapshot.run(snapshot_file, data_file, results_dir, 5, 0, False)
 
-        # 1 source tag push + 1 main tag + 1 tag-source = 3
-        assert run_mocks.push_image.call_count == 3
+        # Source and main images each use one copy job per repository.
+        assert run_mocks.push_image.call_count == 2
 
     def test_source_container_not_found_raises(self, tmp_path: Path, run_mocks) -> None:
         """Raise ``RuntimeError`` when the source container digest can't be resolved."""

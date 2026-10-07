@@ -48,7 +48,7 @@ MULTI_ARCH_MEDIA_TYPES = frozenset(
 
 @dataclass(frozen=True)
 class PushJob:
-    """Parameters for a single image push operation."""
+    """Parameters for one image copy and its destination tags."""
 
     origin_digest: str
     name: str
@@ -59,6 +59,7 @@ class PushJob:
     source_auth_file: Path
     retries: int
     copy_bundle_migrations: bool
+    additional_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -213,11 +214,57 @@ def _discover_artifacts_with_retry(
         return []
 
 
-def push_image(job: PushJob) -> dict[str, str]:
-    """Push a single image to a destination repository.
+def _tag_additional_images(job: PushJob, dest_ref: str, dest_auth_file: Path) -> None:
+    """Apply remaining tags to the copied destination manifest."""
+    if not job.additional_tags:
+        return
 
-    Skip the push when the destination already holds the expected digest.
-    Returns a dict with ``name`` and ``url`` keys.
+    # All tags share the copied manifest and its digest-based attachments.
+    destination_digest = oras_utils.oras_resolve(dest_ref, auth_file=dest_auth_file)
+    if destination_digest is None:
+        raise RuntimeError(f"Failed to resolve destination digest for {dest_ref}")
+
+    def do_tag() -> None:
+        tags_to_apply = [
+            tag
+            for tag in job.additional_tags
+            if oras_utils.oras_resolve(
+                f"{job.repository_url}:{tag}", auth_file=dest_auth_file, check=False
+            )
+            != destination_digest
+        ]
+        if tags_to_apply:
+            logger.info(
+                "Tagging %s with %d additional destination tags",
+                dest_ref,
+                len(tags_to_apply),
+            )
+            subprocess_cmd.run_cmd(
+                [
+                    "oras",
+                    "tag",
+                    "--concurrency",
+                    "1",
+                    "--registry-config",
+                    str(dest_auth_file),
+                    f"{job.repository_url}@{destination_digest}",
+                    *tags_to_apply,
+                ],
+                check=True,
+            )
+
+    retry.retry_with_exponential_backoff(
+        do_tag,
+        max_attempts=job.retries + 1,
+        base_sleep_seconds=0,
+    )
+
+
+def push_image(job: PushJob) -> dict[str, str]:
+    """Copy an image once to a repository and apply its remaining tags.
+
+    Skip the copy when the first tag already holds the expected digest.
+    Return a dict with ``name`` and the first ``url``.
     """
     dest_auth_file = create_dest_auth_file(job.repository_url)
     try:
@@ -232,6 +279,7 @@ def push_image(job: PushJob) -> dict[str, str]:
                 job.name,
                 job.container_image,
             )
+            _tag_additional_images(job, dest_ref, dest_auth_file)
             return {"name": job.name, "url": dest_ref}
 
         logger.info("Pushing component: %s to %s:%s", job.name, job.repository_url, job.tag)
@@ -312,6 +360,7 @@ def push_image(job: PushJob) -> dict[str, str]:
         finally:
             shutil.rmtree(docker_config_dir, ignore_errors=True)
 
+        _tag_additional_images(job, dest_ref, dest_auth_file)
         return {"name": job.name, "url": dest_ref}
     finally:
         dest_auth_file.unlink(missing_ok=True)
@@ -491,10 +540,15 @@ def _build_component_jobs(
     jobs: list[tuple[Any, PushJob | MigrationJob]] = []
 
     for repo in resolved.repositories:
-        tags = repo.get("tags", [])
+        tags = tuple(dict.fromkeys(repo.get("tags", [])))
         repository_url = repo["url"]
 
         if resolved.source_container_digest:
+            source_tags = tuple(
+                dict.fromkeys(
+                    [resolved.source_tag, *(f"{tag}-source" for tag in tags)]
+                )
+            )
             jobs.append(
                 (
                     push_image,
@@ -503,16 +557,17 @@ def _build_component_jobs(
                         name=resolved.name,
                         container_image=resolved.source_container,
                         repository_url=repository_url,
-                        tag=resolved.source_tag,
+                        tag=source_tags[0],
                         platform="",
                         source_auth_file=resolved.source_auth_file,
                         retries=retries,
                         copy_bundle_migrations=False,
+                        additional_tags=source_tags[1:],
                     ),
                 )
             )
 
-        for tag in tags:
+        if tags:
             jobs.append(
                 (
                     push_image,
@@ -521,32 +576,15 @@ def _build_component_jobs(
                         name=resolved.name,
                         container_image=resolved.container_image,
                         repository_url=repository_url,
-                        tag=tag,
+                        tag=tags[0],
                         platform=resolved.platform,
                         source_auth_file=resolved.source_auth_file,
                         retries=retries,
                         copy_bundle_migrations=copy_bundle_migrations,
+                        additional_tags=tags[1:],
                     ),
                 )
             )
-
-            if resolved.source_container_digest:
-                jobs.append(
-                    (
-                        push_image,
-                        PushJob(
-                            origin_digest=resolved.source_container_digest,
-                            name=resolved.name,
-                            container_image=resolved.source_container,
-                            repository_url=repository_url,
-                            tag=f"{tag}-source",
-                            platform="",
-                            source_auth_file=resolved.source_auth_file,
-                            retries=retries,
-                            copy_bundle_migrations=False,
-                        ),
-                    )
-                )
 
         if copy_bundle_migrations and resolved.migration_digest and resolved.migration_tag:
             jobs.append(
@@ -595,13 +633,13 @@ def run(
     memory_throttle.log_memory_throttle_status(MEMORY_THRESHOLD)
 
     source_auth_files: list[Path] = []
-    futures: list[Any] = []
+    futures: dict[Any, PushJob | MigrationJob] = {}
     jobs_spawned = 0
 
-    def _submit_throttled(fn: Any, job: Any) -> None:
+    def _submit_throttled(fn: Any, job: PushJob | MigrationJob) -> None:
         nonlocal jobs_spawned
         memory_throttle.wait_for_memory(MEMORY_THRESHOLD)
-        futures.append(executor.submit(fn, job))
+        futures[executor.submit(fn, job)] = job
         jobs_spawned += 1
         if jobs_spawned % BURST_SIZE == 0:
             time.sleep(STABILIZATION_DELAY)
@@ -639,6 +677,12 @@ def run(
                     result = future.result()
                     if isinstance(result, dict):
                         push_results.append(result)
+                        job = futures[future]
+                        if isinstance(job, PushJob):
+                            push_results.extend(
+                                {"name": job.name, "url": f"{job.repository_url}:{tag}"}
+                                for tag in job.additional_tags
+                            )
                 except Exception as exc:
                     failures.append(str(exc))
                     logger.error("Push failed: %s", exc)
